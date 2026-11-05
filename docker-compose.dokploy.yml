@@ -1,0 +1,261 @@
+# Production compose for Dokploy (self-host, fully local AI: Whisper + Ollama).
+#
+# Differences from docker-compose.yml:
+#   - frontend is built with the production `runner` target (no source mounts)
+#   - no container_name / host ports: Traefik (dokploy-network) routes traffic
+#   - an `ollama` service runs the LLM; `ollama-init` pulls the model once
+#   - CPU-only backend image (no CUDA wheels) and memory limits per service
+#   - secrets and public URLs come from the Dokploy "Environment" tab
+#
+# Required environment variables (set them in Dokploy):
+#   APP_DOMAIN, API_DOMAIN, POSTGRES_PASSWORD, REDIS_PASSWORD,
+#   BETTER_AUTH_SECRET, BACKEND_AUTH_SECRET, APP_SETTINGS_ENCRYPTION_KEY
+
+x-backend-env: &backend-env
+  PYTHONPATH: /app
+  PYTHONUNBUFFERED: "1"
+  DATABASE_URL: postgresql+asyncpg://supoclip:${POSTGRES_PASSWORD}@postgres:5432/supoclip
+  TEMP_DIR: /app/uploads
+  MEDIA_STORAGE: local
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  # Local AI
+  TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-whisper}
+  TRANSCRIPTION_LANGUAGE: ${TRANSCRIPTION_LANGUAGE:-}
+  WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-medium}
+  LLM: ollama:${OLLAMA_MODEL:-gpt-oss:20b}
+  AI_EDIT_MODEL: ollama:${OLLAMA_MODEL:-gpt-oss:20b}
+  OLLAMA_BASE_URL: http://ollama:11434/v1
+  # Optional cloud keys (leave empty to stay fully local)
+  ASSEMBLY_AI_API_KEY: ${ASSEMBLY_AI_API_KEY:-}
+  PEXELS_API_KEY: ${PEXELS_API_KEY:-}
+  # Processing
+  DEFAULT_PROCESSING_MODE: ${DEFAULT_PROCESSING_MODE:-fast}
+  MAX_CLIPS: ${MAX_CLIPS:-10}
+  FAST_MODE_MAX_CLIPS: ${FAST_MODE_MAX_CLIPS:-10}
+  MAX_VIDEO_DURATION: ${MAX_VIDEO_DURATION:-5400}
+  MAX_VIDEO_UPLOAD_BYTES: ${MAX_VIDEO_UPLOAD_BYTES:-4000000000}
+  # Local AI on CPU is slow; give queued tasks more time before failing them.
+  QUEUED_TASK_TIMEOUT_SECONDS: ${QUEUED_TASK_TIMEOUT_SECONDS:-1800}
+  YOUTUBE_DOWNLOAD_PROVIDER: yt_dlp
+  # App / auth
+  SELF_HOST: "true"
+  BACKEND_AUTH_SECRET: ${BACKEND_AUTH_SECRET}
+  APP_SETTINGS_ENCRYPTION_KEY: ${APP_SETTINGS_ENCRYPTION_KEY}
+  CORS_ORIGINS: https://${APP_DOMAIN}
+  NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+  SOCIAL_PUBLISHING_ACCESS: "off"
+
+x-backend-build: &backend-build
+  context: ./backend
+  dockerfile: Dockerfile
+  args:
+    BACKEND_CPU_ONLY: "true"
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      target: runner
+      args:
+        - NEXT_PUBLIC_API_URL=https://${API_DOMAIN}
+        - NEXT_PUBLIC_APP_URL=https://${APP_DOMAIN}
+        - NEXT_PUBLIC_SELF_HOST=true
+        - NEXT_PUBLIC_MAX_VIDEO_UPLOAD_BYTES=${MAX_VIDEO_UPLOAD_BYTES:-4000000000}
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+      NEXT_PUBLIC_API_URL: https://${API_DOMAIN}
+      NEXT_PUBLIC_APP_URL: https://${APP_DOMAIN}
+      NEXT_PUBLIC_SELF_HOST: "true"
+      BACKEND_INTERNAL_URL: http://backend:8000
+      DATABASE_URL: postgresql://supoclip:${POSTGRES_PASSWORD}@postgres:5432/supoclip
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      BETTER_AUTH_URL: https://${APP_DOMAIN}
+      BACKEND_AUTH_SECRET: ${BACKEND_AUTH_SECRET}
+      APP_SETTINGS_ENCRYPTION_KEY: ${APP_SETTINGS_ENCRYPTION_KEY}
+      # Set to true in Dokploy after creating your own account.
+      DISABLE_SIGN_UP: ${DISABLE_SIGN_UP:-false}
+    networks: [default, dokploy-network]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3107/api/auth/get-session"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  backend:
+    build: *backend-build
+    command: [".venv/bin/uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *backend-env
+      SUPOCLIP_SERVICE: backend
+    volumes:
+      - uploads:/app/uploads
+      - clips:/app/clips
+    networks: [default, dokploy-network]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/db"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # Video pipeline: download, Whisper transcription, clip rendering.
+  worker:
+    build: *backend-build
+    command: [".venv/bin/arq", "src.workers.tasks.WorkerSettings"]
+    environment:
+      <<: *backend-env
+      SUPOCLIP_SERVICE: worker
+    volumes:
+      - uploads:/app/uploads
+      - clips:/app/clips
+      - whisper_cache:/root/.cache/whisper
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 7g
+    healthcheck:
+      test: ["CMD", ".venv/bin/arq", "--check", "src.workers.tasks.WorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  ai-worker:
+    build: *backend-build
+    command: [".venv/bin/arq", "src.workers.ai_worker.AIWorkerSettings"]
+    environment:
+      <<: *backend-env
+      SUPOCLIP_SERVICE: ai-worker
+    volumes:
+      - uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test: ["CMD", ".venv/bin/arq", "--check", "src.workers.ai_worker.AIWorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Local LLM. Unloads the model from RAM after OLLAMA_KEEP_ALIVE of idleness.
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-5m}
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 16g
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # One-shot: downloads the model into the ollama volume (no-op if present).
+  ollama-init:
+    image: ollama/ollama:latest
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-gpt-oss:20b}"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: ["sh", "-c", "exec docker-entrypoint.sh redis-server --requirepass \"$${REDIS_PASSWORD}\""]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: supoclip
+      POSTGRES_USER: supoclip
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supoclip -d supoclip"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  uploads:
+  clips:
+  whisper_cache:
+  ollama_models:
+  redis_data:
+  postgres_data:
+
+networks:
+  dokploy-network:
+    external: true
